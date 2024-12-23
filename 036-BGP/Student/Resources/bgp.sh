@@ -94,11 +94,14 @@ function wait_until_csr_available () {
     echo "Waiting for CSR${csr_id} with IP address $csr_ip to answer over SSH..."
     start_time=$(date +%s)
     ssh_command="show version | include uptime"  # 'show version' contains VM name and uptime
+    # TODO: replace with az network bastion ssh
     ssh_output=$(ssh -n -o ConnectTimeout=60 -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" "$ssh_command" 2>/dev/null)
     until [[ -n "$ssh_output" ]]
     do
         sleep $wait_interval
+        # TODO: re-examine need for fixing NSGs here
         fix_all_nsgs # possible my NSGs are broken?
+        # TODO: replace with az network bastion ssh
         ssh_output=$(ssh -n -o ConnectTimeout=60 -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" "$ssh_command" 2>/dev/null)
     done
     run_time=$(("$(date +%s)" - "$start_time"))
@@ -229,6 +232,7 @@ function create_vng () {
             --private-ip-address "10.${id}.1.4" --public-ip-address "$test_vm_pip_name" -o none
 
         # Not using $psk as password because it might not fulfill the password requirements for Azure VMs
+        # TODO: replace --generate-ssh-keys with ed25519 public key generated earlier
         az vm create -n "$test_vm_name" -g "$rg" -l "$location" --image "$test_vm_image_urn" --size "$test_vm_size" \
             --generate-ssh-keys --authentication-type all --admin-username "$default_username" --admin-password "$psk" \
             --nics "$test_vm_nic_name" --no-wait -o none
@@ -430,6 +434,7 @@ function create_vm_in_csr_vnet () {
         az network nic create -n "$vm_nic_name" -g "$rg" -l "$location" --vnet-name "$vnet_name" --subnet $vm_subnet_name \
             --private-ip-address "10.${id}.1.4" --public-ip-address "$vm_pip_name" -o none
         
+        # TODO: replace --generate-ssh-keys with ed25519 public key generated earlier
         az vm create -n "$vm_name" -g "$rg" -l "$location" --image "$test_vm_image_urn" --size "$vm_size" \
             --generate-ssh-keys --authentication-type all --admin-username "$default_username" --admin-password "$psk" \
             --nics "$vm_nic_name" --no-wait -o none
@@ -496,6 +501,7 @@ function create_csr () {
         az network nic create -n "$csr_nic_name" -g "$rg" -l "$location" --vnet-name "$csr_name" --subnet nva \
             --private-ip-address "$csr_bgp_ip" --public-ip-address "$csr_pip_name" --ip-forwarding true -o none
 
+        # TODO: replace --generate-ssh-keys with ed25519 public key generated earlier
         az vm create -n "csr${csr_id}-nva" -g "$rg" -l "$location" --image "${nva_publisher}:${nva_offer}:${nva_sku}:${nva_version}" --size "$nva_size" \
             --generate-ssh-keys --admin-username "$default_username" --nics "$csr_nic_name" --no-wait -o none
     else
@@ -579,6 +585,7 @@ function connect_csr () {
 function sh_csr_int () {
     csr_id=$1
     csr_ip=$(az network public-ip show -n "csr${csr_id}-pip" -g "$rg" -o tsv --query ipAddress)
+    # TODO: replace with az network bastion ssh
     ssh -n -o StrictHostKeyChecking=no -o ServerAliveInterval=60 -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" "sh ip int b" 2>/dev/null
 }
 
@@ -606,6 +613,7 @@ function config_csr_base () {
 
     echo "Configuring CSR${csr_id} at ${csr_ip} for necessary licensing features to use VPN and rebooting..."
     wait_until_csr_available "${csr_id}" # Make sure I can still talk to the CSR
+    # TODO: replace with az network bastion ssh
     ssh -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" >/dev/null 2>&1 <<EOF
     config t
         license boot level network-advantage addon dna-advantage
@@ -623,6 +631,7 @@ EOF
     username=$(whoami)
     password=$psk
     wait_until_csr_available "${csr_id}" # Make sure I can still talk to the CSR
+    # TODO: replace with az network bastion ssh
     ssh -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" >/dev/null 2>&1 <<EOF
     config t
       username ${username} password 0 ${password}
@@ -696,6 +705,7 @@ function config_csr_tunnel () {
     csr_ip=$(az network public-ip show -n "csr${csr_id}-pip" -g "$rg" -o tsv --query ipAddress)
     echo "Configuring tunnel ${tunnel_id} in CSR${csr_id} at ${csr_ip}..."
     wait_until_csr_available "${csr_id}" # Make sure I can still talk to the CSR
+    # TODO: replace with az network bastion ssh
     ssh -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" >/dev/null 2>&1 <<EOF
     config t
       crypto ikev2 keyring azure-keyring
@@ -721,6 +731,7 @@ EOF
     then
       echo "Configuring BGP on tunnel ${tunnel_id} in CSR ${csr_ip}..."
       wait_until_csr_available "${csr_id}" # Make sure I can still talk to the CSR
+      # TODO: replace with az network bastion ssh
       ssh -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" >/dev/null 2>&1 <<EOF
         config t
           router bgp ${asn}
@@ -733,6 +744,7 @@ EOF
       then
         # iBGP
         wait_until_csr_available "${csr_id}" # Make sure I can still talk to the CSR
+        # TODO: replace with az network bastion ssh
         ssh -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" >/dev/null 2>&1 <<EOF
             config t
               router bgp ${asn}
@@ -743,6 +755,7 @@ EOF
       else
         # eBGP
         wait_until_csr_available "${csr_id}" # Make sure I can still talk to the CSR
+        # TODO: replace with az network bastion ssh
         ssh -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" >/dev/null 2>&1 <<EOF
             config t
               router bgp ${asn}
@@ -755,6 +768,7 @@ EOF
     then
       echo "Configuring OSPF on tunnel ${tunnel_id} in CSR ${csr_ip}..."
       wait_until_csr_available "${csr_id}" # Make sure I can still talk to the CSR
+      # TODO: replace with az network bastion ssh
       ssh -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" >/dev/null 2>&1 <<EOF
         config t
           router ospf 100
@@ -769,6 +783,7 @@ EOF
       remote_id=$(echo "$tunnel_id" | head -c 2 | tail -c 1) # This only works with a max of 9 routers
       echo "Configuring OSPF on tunnel ${tunnel_id} in CSR ${csr_ip}..."
       wait_until_csr_available "${csr_id}" # Make sure I can still talk to the CSR
+      # TODO: replace with az network bastion ssh
       ssh -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" >/dev/null 2>&1 <<EOF
         config t
           ip route 10.${remote_id}.0.0 255.255.0.0 Tunnel${tunnel_id}
@@ -941,6 +956,7 @@ function show_bgp_neighbors () {
     if [[ "$type" == "csr" ]]
     then
         ip=$(az network public-ip show -n "csr${id}-pip" -g "$rg" --query ipAddress -o tsv)
+        # TODO: replace with az network bastion ssh
         neighbors=$(ssh -n -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${ip}" "show ip bgp summary | begin Neighbor" 2>/dev/null)
         echo "BGP neighbors for csr${id}-nva (${ip}):"
         clean_string "$neighbors"
@@ -1227,6 +1243,12 @@ accept_csr_terms
 # Create resource group
 echo "Creating resource group \"$rg\" in subscription \"$subscription_name\"..."
 az group create -n "$rg" -l "$location" -o none
+
+# TODO: Define SSH key pair to be used in this lab
+
+# TODO: Deploy Key Vault
+
+# TODO: Deploy Bastion
 
 # Deploy CSRs and VNGs
 # echo "Routers array: $routers"
