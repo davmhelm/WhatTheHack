@@ -26,7 +26,8 @@ Improvements
         az keyvault check-name -n "$vaultname"
         vaultid=$(az keyvault create -n "$vaultname" -l $location -g $rgname --sku standard --query "id" -o tsv)
         az role assignment create --role "Key Vault Administrator" --scope $vaultid --assignee "$(az account show --query 'user.name' -o tsv)"
-        az keyvault secret set --vault-name "$vaultname" --name "SSH_PrivateKey" -f $sshpath/$sshfile -e base64
+        # Ref https://learn.microsoft.com/en-us/cli/azure/keyvault/secret?view=azure-cli-latest#az-keyvault-secret-set
+        az keyvault secret set --vault-name "$vaultname" --name "SshPrivateKey" --content-type "base64" --value "$(base64 -w0 $sshpath/$sshfile)"
         ```
 
 - [ ] Deploy Bastion, ref https://learn.microsoft.com/en-us/azure/bastion/create-host-cli
@@ -37,5 +38,5 @@ Improvements
         - Create Bastion first and wait for availability? Likely.
         - When to do VNet peering? Probably at time of lab VNet creations.
 
-- [ ] Replace use of SSH with Azure Bastion SSH, ref https://learn.microsoft.com/en-us/azure/bastion/connect-vm-native-client-linux#ssh
+- [ ] Replace use of SSH with Azure Bastion SSH, ref https://learn.microsoft.com/en-us/azure/bastion/connect-vm-native-client-linux#ssh and https://learn.microsoft.com/en-us/cli/azure/network/bastion?view=azure-cli-latest#az-network-bastion-ssh
     - [ ] Improve readability of SSH command options by defining once and re-using? See https://stackoverflow.com/a/56960067

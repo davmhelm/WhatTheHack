@@ -85,37 +85,72 @@ function clean_string () {
     echo "$output"
 }
 
-# Wait until a public IP address answers via SSH
+# Connect CSR VNets to Bastion to enable provisioning
+function connect_csrs_to_bastion () {
+    for router in "${routers[@]}"
+    do
+        type=$(get_router_type "$router")
+        id=$(get_router_id "$router")
+        if [[ "$type" == "csr" ]]
+        then
+            vnet_name=csr${id}
+            connect_vnet_to_bastion $vnet_name
+        fi
+    done
+}
+
+# Wait until all VNGs in the router list finish provisioning before peering VNets
+function connect_gws_to_bastion () {
+    for router in "${routers[@]}"
+    do
+        type=$(get_router_type "$router")
+        id=$(get_router_id "$router")
+        if [[ "$type" == "vng" ]] || [[ "$type" == "vng1" ]] || [[ "$type" == "vng2" ]]
+        then
+            vnet_name=vng${id}
+            connect_vnet_to_bastion $vnet_name
+        fi
+    done
+}
+
+# Peer a VNet to Bastion VNet for SSH access
+function connect_vnet_to_bastion () {
+    vnet_name=$1
+    echo "Peering \"$vnet_name\" VNet to \"bastion\" VNet for remote SSH access..."
+    az network vnet peering create --name "${vnet_name}-bastion-peering" --resource-group "$rg" --vnet-name $vnet_name --remote-vnet bastion --allow-forwarded-traffic --allow-vnet-access -o none
+    az network vnet peering create --name "bastion-${vnet_name}-peering" --resource-group "$rg" --vnet-name bastion --remote-vnet $vnet_name --allow-forwarded-traffic --allow-vnet-access -o none
+}
+
+# Wait until a CSR device answers via Bastion SSH
 # The only thing CSR-specific is the command sent
 function wait_until_csr_available () {
     wait_interval=15
     csr_id=$1
-    csr_ip=$(az network public-ip show -n "csr${csr_id}-pip" -g "$rg" --query ipAddress -o tsv)
-    echo "Waiting for CSR${csr_id} with IP address $csr_ip to answer over SSH..."
+    
+    csr_resourceid=$(az vm show -n "csr${csr_id}-nva" -g "$rg" --query id -o tsv)
+    echo "Waiting for CSR${csr_id} to answer over Bastion SSH..."
     start_time=$(date +%s)
+    ssh_args=( -o ConnectTimeout=60 -o ServerAliveInterval=60 -o BatchMode=yes )
     ssh_command="show version | include uptime"  # 'show version' contains VM name and uptime
-    # TODO: replace with az network bastion ssh
-    ssh_output=$(ssh -n -o ConnectTimeout=60 -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" "$ssh_command" 2>/dev/null)
+    
+    ssh_output=$( az network bastion ssh --name "bastion" -g "$rg" --target-resource-id "$csr_resourceid" --auth-type ssh-key --username "$default_username" --ssh-key "$sshpath/$sshfile" -- ${ssh_args[@]} "$ssh_command" 2>/dev/null )
     until [[ -n "$ssh_output" ]]
     do
         sleep $wait_interval
-        # TODO: re-examine need for fixing NSGs here
-        fix_all_nsgs # possible my NSGs are broken?
-        # TODO: replace with az network bastion ssh
-        ssh_output=$(ssh -n -o ConnectTimeout=60 -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" "$ssh_command" 2>/dev/null)
+        ssh_output=$( az network bastion ssh --name "bastion" -g "$rg" --target-resource-id "$csr_resourceid" --auth-type ssh-key --username "$default_username" --ssh-key "$sshpath/$sshfile" -- ${ssh_args[@]} "$ssh_command" 2>/dev/null )
     done
     run_time=$(("$(date +%s)" - "$start_time"))
     ((minutes=run_time/60))
     ((seconds=run_time%60))
-    echo "IP address $csr_ip is available (wait time $minutes minutes and $seconds seconds). Answer to SSH command \"$ssh_command\": $(clean_string "$ssh_output")"
+    echo "VM csr${csr_id} is available (wait time $minutes minutes and $seconds seconds). Answer to SSH command \"$ssh_command\": $(clean_string "$ssh_output")"
 }
 
 # Wait until all VNGs in the router list finish provisioning
 function wait_for_csrs_finished () {
     for router in "${routers[@]}"
     do
-        type=$(get_router_type  "$router")
-        id=$(get_router_id  "$router")
+        type=$(get_router_type "$router")
+        id=$(get_router_id "$router")
         if [[ "$type" == "csr" ]]
         then
             wait_until_csr_available "$id"
@@ -150,9 +185,9 @@ function fix_nsg () {
     fi
 
     #echo "Adding SSH permit for ${myip} to NSG ${nsg_name}..."    
-    az network nsg rule create --nsg-name "$nsg_name" -g "$rg" -n ssh-inbound-allow --priority 1000 \
-        --source-address-prefixes "$myip" --destination-port-ranges 22 --access Allow --protocol Tcp \
-        --description "Allow ssh inbound"  -o none
+    #az network nsg rule create --nsg-name "$nsg_name" -g "$rg" -n ssh-inbound-allow --priority 1000 \
+    #    --source-address-prefixes "$myip" --destination-port-ranges 22 --access Allow --protocol Tcp \
+    #   --description "Allow ssh inbound"  -o none
 
     #echo "Adding RFC1918 prefixes to NSG ${nsg_name}..."
     az network nsg rule create --nsg-name "$nsg_name" -g "$rg" -n Allow_Inbound_RFC1918 --priority 2000 \
@@ -205,7 +240,7 @@ function create_vng () {
     vnet_prefix=10.${id}.0.0/16
     subnet_prefix=10.${id}.0.0/24
     test_vm_name=testvm${id}
-    test_vm_nsg_name="${test_vm_name}-NSG"
+    test_vm_nsg_name="${test_vm_name}-nsg"
     test_vm_nic_name="${test_vm_name}-nic"
     test_vm_pip_name="${test_vm_name}-pip"
     test_vm_size=Standard_B1s
@@ -413,7 +448,7 @@ function create_vm_in_csr_vnet () {
     vm_subnet_prefix="10.${csr_id}.1.0/24"
     vm_subnet_name=testvm
     vm_name=testvm${csr_id}
-    vm_nsg_name="${vm_name}-NSG"
+    vm_nsg_name="${vm_name}-nsg"
     vm_nic_name="${vm_name}-nic"
     vm_pip_name="${vm_name}-pip"
     vm_size=Standard_B1s
@@ -435,8 +470,11 @@ function create_vm_in_csr_vnet () {
             --private-ip-address "10.${id}.1.4" --public-ip-address "$vm_pip_name" -o none
         
         # TODO: replace --generate-ssh-keys with ed25519 public key generated earlier
+        #az vm create -n "$vm_name" -g "$rg" -l "$location" --image "$test_vm_image_urn" --size "$vm_size" \
+        #    --generate-ssh-keys --authentication-type all --admin-username "$default_username" --admin-password "$psk" \
+        #    --nics "$vm_nic_name" --no-wait -o none
         az vm create -n "$vm_name" -g "$rg" -l "$location" --image "$test_vm_image_urn" --size "$vm_size" \
-            --generate-ssh-keys --authentication-type all --admin-username "$default_username" --admin-password "$psk" \
+            --ssh-key-name SshKey --authentication-type all --admin-username "$default_username" --admin-password "$psk" \
             --nics "$vm_nic_name" --no-wait -o none
         az network route-table create -n "$rt_name" -g "$rg" -l "$location" -o none
         az network route-table route create -n localrange -g "$rg" --route-table-name "$rt_name" \
@@ -472,8 +510,8 @@ function accept_csr_terms () {
 function create_csr () {
     # USES NVA GLOBALS
     csr_id=$1
-    csr_name=csr${csr_id}
-    csr_nsg_name="${csr_name}-NSG"
+    csr_name="csr${csr_id}"
+    csr_nsg_name="${csr_name}-nsg"
     csr_nic_name="${csr_name}-nic"
     csr_pip_name="${csr_name}-pip"
     csr_vnet_prefix="10.${csr_id}.0.0/16"
@@ -483,8 +521,8 @@ function create_csr () {
     nva_version=$(az vm image list -p $nva_publisher -f $nva_offer -s $nva_sku --all --query '[0].version' -o tsv)
     nva_size=Standard_B2ms
     # Create CSR
-    echo "Creating VM csr${csr_id}-nva in Vnet $csr_vnet_prefix..."
-    vm_id=$(az vm show -n "csr${csr_id}-nva" -g "$rg" --query id -o tsv 2>/dev/null)
+    echo "Creating VM \"$csr_name-nva\" in Vnet $csr_vnet_prefix..."
+    vm_id=$(az vm show -n "$csr_name-nva" -g "$rg" --query id -o tsv 2>/dev/null)
     if [[ -z "$vm_id" ]]
     then
         az network nsg create -n "$csr_nsg_name" -g "$rg" -l "$location" -o none
@@ -502,16 +540,18 @@ function create_csr () {
             --private-ip-address "$csr_bgp_ip" --public-ip-address "$csr_pip_name" --ip-forwarding true -o none
 
         # TODO: replace --generate-ssh-keys with ed25519 public key generated earlier
-        az vm create -n "csr${csr_id}-nva" -g "$rg" -l "$location" --image "${nva_publisher}:${nva_offer}:${nva_sku}:${nva_version}" --size "$nva_size" \
-            --generate-ssh-keys --admin-username "$default_username" --nics "$csr_nic_name" --no-wait -o none
+        #az vm create -n "csr${csr_id}-nva" -g "$rg" -l "$location" --image "${nva_publisher}:${nva_offer}:${nva_sku}:${nva_version}" --size "$nva_size" \
+        #    --generate-ssh-keys --admin-username "$default_username" --nics "$csr_nic_name" --no-wait -o none
+        az vm create -n "$csr_name-nva" -g "$rg" -l "$location" --image "${nva_publisher}:${nva_offer}:${nva_sku}:${nva_version}" --size "$nva_size" \
+            --ssh-key-name SshKey --admin-username "$default_username" --nics "$csr_nic_name" --no-wait -o none
     else
-        echo "VM csr${csr_id}-nva already exists"
+        echo "VM \"$csr_name-nva\" already exists"
     fi
 
     # Get public IP
     csr_ip=$(az network public-ip show -n "csr${csr_id}-pip" -g "$rg" --query ipAddress -o tsv)
     # Create Local Network Gateway
-    echo "CSR created with IP address $csr_ip. Creating Local Network Gateway now..."
+    echo "CSR \"$csr_name-nva\" created with IP address $csr_ip. Creating Local Network Gateway now..."
     asn=$(get_router_asn_from_id "$csr_id")
     local_gw_id=$(az network local-gateway show -g "$rg" -n "${csr_name}" --query id -o tsv 2>/dev/null)
     if [[ -z "$local_gw_id" ]]
@@ -584,22 +624,29 @@ function connect_csr () {
 # Run "show interface ip brief" on CSR
 function sh_csr_int () {
     csr_id=$1
-    csr_ip=$(az network public-ip show -n "csr${csr_id}-pip" -g "$rg" -o tsv --query ipAddress)
+    #csr_ip=$(az network public-ip show -n "csr${csr_id}-pip" -g "$rg" -o tsv --query ipAddress)
+    csr_resourceid=$(az vm show -n "csr${csr_id}-nva" -g "$rg" --query id -o tsv )
     # TODO: replace with az network bastion ssh
-    ssh -n -o StrictHostKeyChecking=no -o ServerAliveInterval=60 -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" "sh ip int b" 2>/dev/null
+    #ssh -n -o StrictHostKeyChecking=no -o ServerAliveInterval=60 -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" "sh ip int b" 2>/dev/null
+    ssh_args=( -o ConnectTimeout=60 -o ServerAliveInterval=60 -o BatchMode=yes )
+    az network bastion ssh --name "bastion" -g "$rg" --target-resource-id "$csr_resourceid" --auth-type ssh-key --username "$default_username" --ssh-key "$sshpath/$sshfile" -- ${ssh_args[@]} "sh ip int b" 2>/dev/null
 }
 
 # Open an interactive SSH session to a CSR
 function ssh_csr () {
     csr_id=$1
-    csr_ip=$(az network public-ip show -n "csr${csr_id}-pip" -g "$rg" -o tsv --query ipAddress)
-    ssh "$csr_ip"
+    #csr_ip=$(az network public-ip show -n "csr${csr_id}-pip" -g "$rg" -o tsv --query ipAddress)
+    #ssh "$csr_ip"
+    csr_resourceid=$(az vm show -n "csr${csr_id}-nva" -g "$rg" --query id -o tsv)
+    ssh_args=( -o ConnectTimeout=60 -o ServerAliveInterval=60 )
+    az network bastion ssh --name "bastion" -g "$rg" --target-resource-id "$csr_resourceid" --auth-type ssh-key --username "$default_username" --ssh-key "$sshpath/$sshfile" -- ${ssh_args[@]}
 }
 
 # Deploy baseline, VPN, and BGP config to a Cisco CSR
 function config_csr_base () {
     csr_id=$1
-    csr_ip=$(az network public-ip show -n "csr${csr_id}-pip" -g "$rg" -o tsv --query ipAddress)
+    #csr_ip=$(az network public-ip show -n "csr${csr_id}-pip" -g "$rg" -o tsv --query ipAddress)
+    csr_resourceid=$(az vm show -n "csr${csr_id}-nva" -g "$rg" --query id -o tsv)
     asn=$(get_router_asn_from_id "$csr_id")
     # Grab client IP for static route
         myip=$(curl -s4 "https://api.ipify.org/")
@@ -611,10 +658,13 @@ function config_csr_base () {
     
     default_gateway="10.${csr_id}.0.1"
 
-    echo "Configuring CSR${csr_id} at ${csr_ip} for necessary licensing features to use VPN and rebooting..."
+    #echo "Configuring CSR${csr_id} at ${csr_ip} for necessary licensing features to use VPN and rebooting..."
+    echo "Configuring CSR${csr_id} for necessary licensing features to use VPN and rebooting..."
     wait_until_csr_available "${csr_id}" # Make sure I can still talk to the CSR
     # TODO: replace with az network bastion ssh
-    ssh -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" >/dev/null 2>&1 <<EOF
+    #ssh -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" >/dev/null 2>&1 <<EOF
+    ssh_args=( -o ConnectTimeout=60 -o ServerAliveInterval=60 -o BatchMode=yes )
+    az network bastion ssh --name "bastion" -g "$rg" --target-resource-id "$csr_resourceid" --auth-type ssh-key --username "$default_username" --ssh-key "$sshpath/$sshfile" -- ${ssh_args[@]} >/dev/null 2>&1 <<EOF
     config t
         license boot level network-advantage addon dna-advantage
         do wr mem
@@ -627,12 +677,14 @@ EOF
     sleep 60 # Avoid re-checking availability too early
     wait_until_csr_available "${csr_id}"
 
-    echo "Configuring CSR${csr_id} at ${csr_ip} for VPN and BGP..."
+    #echo "Configuring CSR${csr_id} at ${csr_ip} for VPN and BGP..."
+    echo "Configuring CSR${csr_id} for VPN and BGP..."
     username=$(whoami)
     password=$psk
     wait_until_csr_available "${csr_id}" # Make sure I can still talk to the CSR
     # TODO: replace with az network bastion ssh
-    ssh -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" >/dev/null 2>&1 <<EOF
+    #ssh -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" >/dev/null 2>&1 <<EOF
+    az network bastion ssh --name "bastion" -g "$rg" --target-resource-id "$csr_resourceid" --auth-type ssh-key --username "$default_username" --ssh-key "$sshpath/$sshfile" -- ${ssh_args[@]} >/dev/null 2>&1 <<EOF
     config t
       username ${username} password 0 ${password}
       username ${username} privilege 15
@@ -703,10 +755,14 @@ function config_csr_tunnel () {
     asn=$(get_router_asn_from_id "${csr_id}")
     default_gateway="10.${csr_id}.0.1"
     csr_ip=$(az network public-ip show -n "csr${csr_id}-pip" -g "$rg" -o tsv --query ipAddress)
-    echo "Configuring tunnel ${tunnel_id} in CSR${csr_id} at ${csr_ip}..."
+    csr_resourceid=$(az vm show -n "csr${csr_id}-nva" -g "$rg" --query id -o tsv)
+    #echo "Configuring tunnel ${tunnel_id} in CSR${csr_id} at ${csr_ip}..."
+    echo "Configuring tunnel ${tunnel_id} in CSR${csr_id}..."
     wait_until_csr_available "${csr_id}" # Make sure I can still talk to the CSR
     # TODO: replace with az network bastion ssh
-    ssh -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" >/dev/null 2>&1 <<EOF
+    #ssh -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" >/dev/null 2>&1 <<EOF
+    ssh_args=( -o ConnectTimeout=60 -o ServerAliveInterval=60 -o BatchMode=yes )
+    az network bastion ssh --name "bastion" -g "$rg" --target-resource-id "$csr_resourceid" --auth-type ssh-key --username "$default_username" --ssh-key "$sshpath/$sshfile" -- ${ssh_args[@]} >/dev/null 2>&1 <<EOF
     config t
       crypto ikev2 keyring azure-keyring
         peer ${public_ip}
@@ -729,10 +785,12 @@ function config_csr_tunnel () {
 EOF
     if [[ -z "$cx_type" ]] || [[ "$cx_type" == "bgp" ]] || [[ "$cx_type" == "bgpospf" ]]
     then
-      echo "Configuring BGP on tunnel ${tunnel_id} in CSR ${csr_ip}..."
+      #echo "Configuring BGP on tunnel ${tunnel_id} in CSR ${csr_ip}..."
+      echo "Configuring BGP on tunnel ${tunnel_id} in CSR${csr_id}..."
       wait_until_csr_available "${csr_id}" # Make sure I can still talk to the CSR
       # TODO: replace with az network bastion ssh
-      ssh -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" >/dev/null 2>&1 <<EOF
+      #ssh -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" >/dev/null 2>&1 <<EOF
+      az network bastion ssh --name "bastion" -g "$rg" --target-resource-id "$csr_resourceid" --auth-type ssh-key --username "$default_username" --ssh-key "$sshpath/$sshfile" -- ${ssh_args[@]} >/dev/null 2>&1 <<EOF
         config t
           router bgp ${asn}
             neighbor ${private_ip} remote-as ${remote_asn}
@@ -745,7 +803,8 @@ EOF
         # iBGP
         wait_until_csr_available "${csr_id}" # Make sure I can still talk to the CSR
         # TODO: replace with az network bastion ssh
-        ssh -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" >/dev/null 2>&1 <<EOF
+        #ssh -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" >/dev/null 2>&1 <<EOF
+        az network bastion ssh --name "bastion" -g "$rg" --target-resource-id "$csr_resourceid" --auth-type ssh-key --username "$default_username" --ssh-key "$sshpath/$sshfile" -- ${ssh_args[@]} >/dev/null 2>&1 <<EOF
             config t
               router bgp ${asn}
                 neighbor ${private_ip} next-hop-self
@@ -756,7 +815,8 @@ EOF
         # eBGP
         wait_until_csr_available "${csr_id}" # Make sure I can still talk to the CSR
         # TODO: replace with az network bastion ssh
-        ssh -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" >/dev/null 2>&1 <<EOF
+        #ssh -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" >/dev/null 2>&1 <<EOF
+        az network bastion ssh --name "bastion" -g "$rg" --target-resource-id "$csr_resourceid" --auth-type ssh-key --username "$default_username" --ssh-key "$sshpath/$sshfile" -- ${ssh_args[@]} >/dev/null 2>&1 <<EOF
             config t
               router bgp ${asn}
                 neighbor ${private_ip} ebgp-multihop 5
@@ -766,10 +826,12 @@ EOF
       fi
     elif [[ "$cx_type" == "ospf" ]] || [[ "$cx_type" == "bgpospf" ]]
     then
-      echo "Configuring OSPF on tunnel ${tunnel_id} in CSR ${csr_ip}..."
+      #echo "Configuring OSPF on tunnel ${tunnel_id} in CSR ${csr_ip}..."
+      echo "Configuring OSPF on tunnel ${tunnel_id} in CSR${csr_id}..."
       wait_until_csr_available "${csr_id}" # Make sure I can still talk to the CSR
       # TODO: replace with az network bastion ssh
-      ssh -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" >/dev/null 2>&1 <<EOF
+      #ssh -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" >/dev/null 2>&1 <<EOF
+      az network bastion ssh --name "bastion" -g "$rg" --target-resource-id "$csr_resourceid" --auth-type ssh-key --username "$default_username" --ssh-key "$sshpath/$sshfile" -- ${ssh_args[@]} >/dev/null 2>&1 <<EOF
         config t
           router ospf 100
             no passive-interface Tunnel${tunnel_id}
@@ -779,19 +841,22 @@ EOF
 EOF
     elif [[ "$cx_type" == "static" ]]  ## Not used
     then
-      echo "Configuring static routes for tunnel ${tunnel_id} in CSR ${csr_ip}..."
+      #echo "Configuring static routes for tunnel ${tunnel_id} in CSR ${csr_ip}..."
+      echo "Configuring static routes for tunnel ${tunnel_id} in CSR${csr_id}..."
       remote_id=$(echo "$tunnel_id" | head -c 2 | tail -c 1) # This only works with a max of 9 routers
-      echo "Configuring OSPF on tunnel ${tunnel_id} in CSR ${csr_ip}..."
+      #echo "Configuring OSPF on tunnel ${tunnel_id} in CSR ${csr_ip}..."
+      echo "Configuring OSPF on tunnel ${tunnel_id} in CSR${csr_id}..."
       wait_until_csr_available "${csr_id}" # Make sure I can still talk to the CSR
       # TODO: replace with az network bastion ssh
-      ssh -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" >/dev/null 2>&1 <<EOF
+      #ssh -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${csr_ip}" >/dev/null 2>&1 <<EOF
+      az network bastion ssh --name "bastion" -g "$rg" --target-resource-id "$csr_resourceid" --auth-type ssh-key --username "$default_username" --ssh-key "$sshpath/$sshfile" -- ${ssh_args[@]} >/dev/null 2>&1 <<EOF
         config t
           ip route 10.${remote_id}.0.0 255.255.0.0 Tunnel${tunnel_id}
         end
         wr mem
 EOF
     else
-        echo "No routing protocol configured on ${tunnel_id} in CSR ${csr_ip}..."
+        echo "No routing protocol configured on ${tunnel_id} in CSR${csr_id}..."
     fi
 }
 
@@ -955,10 +1020,14 @@ function show_bgp_neighbors () {
     id=$(get_router_id  "$router")
     if [[ "$type" == "csr" ]]
     then
-        ip=$(az network public-ip show -n "csr${id}-pip" -g "$rg" --query ipAddress -o tsv)
+        #ip=$(az network public-ip show -n "csr${id}-pip" -g "$rg" --query ipAddress -o tsv)
+        resourceid=$(az vm show -n "csr${csr_id}-nva" -g "$rg" --query id -o tsv)
         # TODO: replace with az network bastion ssh
-        neighbors=$(ssh -n -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${ip}" "show ip bgp summary | begin Neighbor" 2>/dev/null)
-        echo "BGP neighbors for csr${id}-nva (${ip}):"
+        #neighbors=$(ssh -n -o ServerAliveInterval=60 -o BatchMode=yes -o StrictHostKeyChecking=no -o KexAlgorithms=+diffie-hellman-group14-sha1 -o HostKeyAlgorithms=+ssh-rsa -o PubkeyAcceptedKeyTypes=+ssh-rsa -o MACs=+hmac-sha2-256-etm@openssh.com,hmac-sha2-512-etm@openssh.com "${default_username}@${ip}" "show ip bgp summary | begin Neighbor" 2>/dev/null)
+        ssh_args=( -o ConnectTimeout=60 -o ServerAliveInterval=60 -o BatchMode=yes )
+        neighbors=$(az network bastion ssh --name "bastion" -g "$rg" --target-resource-id "$csr_resourceid" --auth-type ssh-key --username "$default_username" --ssh-key "$sshpath/$sshfile" -- ${ssh_args[@]} "show ip bgp summary | begin Neighbor" 2>/dev/null)
+        #echo "BGP neighbors for csr${id}-nva (${ip}):"
+        echo "BGP neighbors for csr${id}-nva:"
         clean_string "$neighbors"
     else
         neighbors=$(az network vnet-gateway list-bgp-peer-status -n "vng${id}" -g "$rg" -o table)
@@ -1126,13 +1195,67 @@ function check_password () {
     fi
 }
 
+# Valuable in cloud shell environments
+# Avoids relying solely on local storage for SSH key-based authentication
+function prepare_ssh () {
+    echo "Creating SSH public/private keypair at \"$sshpath/$sshfile\"..."
+    ssh-keygen -t ed25519 -f "$sshpath/$sshfile" -C "$default_username" -N "" -q
+    echo "Storing SSH public key in Azure as \"SshKey\"..."
+    az sshkey create -n SshKey -l $location -g "$rg" --encryption-type ed25519 --public-key "@$sshpath/$sshfile.pub" --tags filename="$sshfile.pub" -o none
+}
+
+# Avoids relying solely on local storage for SSH key-based authentication
+# Espeially valuable in cloud shell environments where local storage may be ephemeral to the session
+# Key Vault uses access policy due to challenges with propagation delays for RBAC assignments
+function deploy_key_vault () {
+    vaultname=kv-$(uuidgen | tr -d "-" | head -c 21)
+    echo "Checking Key Vault name availability for \"$vaultname\"..."
+    available=$(az keyvault check-name -n "$vaultname" --query "nameAvailable" -o tsv)
+    declare -i i="0"
+    until [[ $available == "true" ]] || [[ $i -gt 5 ]]
+    do
+        vaultname=kv-$(uuidgen | tr -d "-" | head -c 21)
+        echo "Checking Key Vault name availability for \"$vaultname\"..."
+        available=$(az keyvault check-name -n "$vaultname" --query "nameAvailable" -o tsv)
+        ((i++))
+    done
+    if [[ $i -gt 5 ]]
+    then
+            echo "Something is wrong with my ability to find an available Key Vault name. Response from service: $available"
+            exit 1
+    fi
+
+    echo "Creating Key Vault \"$vaultname\" to store SSH private key in Azure..."
+    vaultid=$(az keyvault create -n "$vaultname" -l $location -g "$rg" --sku standard --enable-rbac-authorization false --no-self-perms false --query "id" -o tsv)
+
+    echo "Storing SSH private key in \"$vaultname\"..."
+    az keyvault secret set --vault-name "$vaultname" --name "SshPrivateKey" --content-type "base64" \
+        --value "$(base64 -w0 $sshpath/$sshfile)" --tags filename="$sshfile" -o none
+}
+
+function deploy_bastion () {
+    bastion_name=bastion
+    echo "Creating Azure Bastion instance \"$bastion_name\" to enable SSH access without exposing public IPs..."
+    az network public-ip create -n "$bastion_name-pip" -g "$rg" -l $location --sku standard -o none
+    az network vnet create -n "$bastion_name" -g "$rg" -l $location --address-prefix "192.168.255.0/24" \
+        --subnet-name "AzureBastionSubnet" --subnet-prefix "192.168.255.0/26" -o none
+    az network bastion create -n "$bastion_name" -g "$rg" --public-ip-address "$bastion_name-pip" --vnet-name "$bastion_name" \
+        --sku standard --enable-tunneling --enable-ip-connect --query id -o tsv --no-wait
+}
+
+function wait_for_bastion_finished () {
+    bastion_name=bastion
+    bastion_id=$(az network bastion show -n $bastion_name -g "$rg" --query id -o tsv)
+    wait_until_finished "$bastion_id"
+}
+
 # Verify certain things:
 # - Presence of required binaries
-# - Presence of requirec az extensions
+# - Presence of required az extensions
 # - Azure CLI logged in
 function perform_system_checks () {
     # Verify software dependencies
-    for binary in "ssh" "jq" "az" "awk"
+    for binary in "ssh" "ssh-keygen" "jq" "az" "awk" "tr" "uuidgen" "base64"
     do
         binary_path=$(which "$binary")
         if [[ -z "$binary_path" ]]
@@ -1152,7 +1275,7 @@ function perform_system_checks () {
     fi
 
     # Verify required az extensions installed
-    for extension_name in "log-analytics"
+    for extension_name in "log-analytics" "ssh" "bastion"
     do
         az extension add --upgrade --yes --name $extension_name -o none
         extension_version=$(az extension show -n $extension_name --query version -o tsv)
@@ -1172,6 +1295,8 @@ function perform_system_checks () {
 
 # Variables
 default_username=labadmin
+sshpath=~/.ssh
+sshfile=id_ed25519_${default_username}_$(date +%s_%N)
 
 # Perform some system checks
 perform_system_checks
@@ -1245,10 +1370,13 @@ echo "Creating resource group \"$rg\" in subscription \"$subscription_name\"..."
 az group create -n "$rg" -l "$location" -o none
 
 # TODO: Define SSH key pair to be used in this lab
+prepare_ssh
 
 # TODO: Deploy Key Vault
+deploy_key_vault
 
 # TODO: Deploy Bastion
+deploy_bastion
 
 # Deploy CSRs and VNGs
 # echo "Routers array: $routers"
@@ -1264,6 +1392,8 @@ do
 done
 
 # Config BGP routers
+connect_csrs_to_bastion # wait_for_csrs_finished depends on Bastion being peered to CSR VNets
+wait_for_bastion_finished # wait_for_csrs_finished depends on Bastion deploymentStatus being Success
 wait_for_csrs_finished
 config_csrs_base
 
@@ -1272,6 +1402,7 @@ fix_all_nsgs
 
 # Wait for VNGs to finish provisioning and configuring logging
 wait_for_gws_finished
+connect_gws_to_bastion
 init_log
 config_gw_logging
 
@@ -1289,6 +1420,12 @@ done
 
 # Finish
 echo "Your resources should be ready to use in resource group $rg. Username/password for access is ${default_username}/${psk}. Enjoy!"
+echo "Connect to VMs using the following command: "
+echo -e "\taz network bastion ssh -n bastion -g $rg --target-resource-id \$vm_id \\"
+echo -e "\t  --auth-type ssh-key --username \"$default_username\" \\"
+echo -e "\t  --ssh-key \"$sshpath/$sshfile\" -- -o ConnectTimeout=60 -o ServerAliveInterval=60\""
+echo "Where \$vm_id is any of the following:"
+az vm list -g $rg --query '[].id' -o tsv
 
 ################################
 # Sample diagnostics commands: #
